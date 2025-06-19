@@ -1,31 +1,103 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# ccurl.sh - Extract cookies from Chromium tab and use with cURL
+#
+# Passes cookies from a Chromium instance and passes them to a cURL command.
+#
+# Usage:
+#   ./ccurl.sh start [chromium-args…]         # start Chromium with debugging
+#   ./ccurl.sh <tab-url-prefix> <curl-args…>  # run curl with extracted cookies
+#
+# Examples:
+#   ./ccurl.sh start --incognito
+#   ./ccurl.sh "https://example.com" -X GET "https://yandex.com/data"
+#
+# Requires: fzf, websocat
 
-# Check if at least two arguments were provided
-if [ "$#" -lt 2 ]; then
-    echo "Usage: $0 [Tab URL Prefix] [cURL command ...]"
+set -euo pipefail
+
+readonly CHROMIUM_DEBUG_PORT=9222
+readonly CHROMIUM_DEBUG_URL="http://127.0.0.1:${CHROMIUM_DEBUG_PORT}/json"
+
+find_chromium() {
+    local chromium_cmd
+    for chromium_cmd in chromium chromium-browser google-chrome chrome; do
+        command -v "${chromium_cmd}" >/dev/null 2>&1 && { printf '%s' "${chromium_cmd}"; return; }
+    done
+    return 1
+}
+
+start_chromium() {
+    local chromium_cmd
+    chromium_cmd=$(find_chromium) || { printf 'Error: Chrome/Chromium not found\n' >&2; exit 1; }
+
+    printf 'Starting %s on port %d…\n' "${chromium_cmd}" "${CHROMIUM_DEBUG_PORT}"
+
+    nohup "${chromium_cmd}" \
+        --remote-debugging-port="${CHROMIUM_DEBUG_PORT}" \
+        --user-data-dir="$(mktemp -d)" \
+        --no-first-run \
+        --no-default-browser-check \
+        "$@" >/dev/null 2>&1 &
+
+    while ! curl -sf "${CHROMIUM_DEBUG_URL}" >/dev/null 2>&1; do
+        sleep 0.1
+    done
+
+    printf 'Chromium started (PID: %d)\n' $!
+}
+
+show_usage() {
+    printf 'Usage: %s start [chromium-args…]\n' "${0##*/}" >&2
+    printf '       %s <tab-url-prefix> <curl-args…>\n' "${0##*/}" >&2
     exit 1
+}
+
+# start subcommand
+[[ ${1:-} == "start" ]] && { shift; start_chromium "$@"; exit; }
+
+# validate arguments for curl
+(( $# < 2 )) && show_usage
+
+# extract arguments
+readonly tab_prefix=$1
+shift
+
+# grab all tabs or fail
+tabs_json=$(curl -sf "${CHROMIUM_DEBUG_URL}" 2>/dev/null) || {
+    printf 'Error: Cannot connect to Chromium on port %d\n' "${CHROMIUM_DEBUG_PORT}" >&2
+    printf 'Start Chromium with: %s start\n' "${0##*/}" >&2
+    exit 1
+}
+
+matching_tabs=$(printf '%s' "${tabs_json}" | \
+    jq -r --arg prefix "${tab_prefix}" \
+    '.[] | select(.url | startswith($prefix)) | "\(.title)\t\(.url)\t\(.webSocketDebuggerUrl)"')
+
+# TODO: show all tabs to select one anyway?
+[[ -z ${matching_tabs} ]] && {
+    printf 'Error: No tab found with URL prefix: %s\n' "${tab_prefix}" >&2
+    exit 1
+}
+
+matching_count=$(printf '%s' "${matching_tabs}" | wc -l)
+
+if (( matching_count == 1 )); then
+    debug_url=$(printf '%s' "${matching_tabs}" | cut -f3)
+else
+    selected=$(printf '%s' "${matching_tabs}" | grep -Ev '^Service Worker' | \
+        fzf --delimiter=$'\t' \
+            --with-nth=1,2 \
+            --height=40% \
+            --layout=reverse \
+            --prompt="Tab> ") || exit 1
+    debug_url=$(printf '%s' "${selected}" | cut -f3)
 fi
 
-# Use cURL to get the JSON information on the openTab using your local Chrome instance's debug feature
-DEBUG_URL=$(curl "http://127.0.0.1:9222/json" -s | jq -r ".[] | select(.url | startswith(\"$1\")) | .webSocketDebuggerUrl")
+cookies=$(printf '{"id":2,"method":"Network.getCookies","params":{}}\n' | \
+    websocat -t - "${debug_url}" | \
+    jq -r '.result.cookies[] | "\(.name)=\(.value)"' | \
+    paste -sd ';' -)
 
-# If debug URL cannot be found, prompt the user and exit
-if ! [[ "$DEBUG_URL" =~ ^ws.* ]]; then
-    echo "Could not find tab starting with '$1'. Is chrome running ?"
-    exit 1
-fi
-
-# Count the number of URLs with that pattern
-URL_COUNT=$(echo "$DEBUG_URL" | tr -cd '\n' | wc -c)
-
-# If there is more than one URL with the specified pattern, prompt the user and exit
-if [[ "$URL_COUNT" -gt 1 ]]; then
-    echo "Pattern '$1' is not precise enough. Multiple tabs/workers where found"
-    exit 1
-fi
-
-# Use websocat to access the Chrome debug port and retrieve the cookies information
-COOKIES=$(echo '{ "id":2, "method":"Network.getCookies", "params":{} }' | websocat -t - $DEBUG_URL | jq -r '.result.cookies[] | "\(.name)=\(.value)"' | tr '\n' ';' | sed 's/\;$/\n/')
-
-# Append the cookies to the specified URL using curl
-curl -H "Cookie: $COOKIES" "${@:2}"
+# …boom, we're off!
+exec curl -H "Cookie: ${cookies}" "$@"
